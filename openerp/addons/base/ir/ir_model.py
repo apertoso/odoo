@@ -62,6 +62,13 @@ def _in_modules(self, cr, uid, ids, field_name, arg, context=None):
         result[k] = ', '.join(sorted(installed_modules & set(xml_id.split('.')[0] for xml_id in v)))
     return result
 
+class unknown(models.AbstractModel):
+    """
+    Abstract model used as a substitute for relational fields with an unknown
+    comodel.
+    """
+    _name = '_unknown'
+
 class ir_model(osv.osv):
     _name = 'ir.model'
     _description = "Models"
@@ -228,12 +235,7 @@ class ir_model(osv.osv):
             _module = False
             _custom = True
 
-        obj = CustomModel._build_model(self.pool, cr)
-        obj._rec_name = CustomModel._rec_name = (
-            'x_name' if 'x_name' in obj._columns else
-            list(obj._columns)[0] if obj._columns else
-            'id'
-        )
+        CustomModel._build_model(self.pool, cr)
 
 class ir_model_fields(osv.osv):
     _name = 'ir.model.fields'
