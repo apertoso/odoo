@@ -25,6 +25,7 @@ import time
 from openerp import tools
 from openerp.osv import fields, osv
 from openerp.tools.translate import _
+from openerp import SUPERUSER_ID
 
 class account_followup_stat_by_partner(osv.osv):
     _name = "account_followup.stat.by.partner"
@@ -200,7 +201,9 @@ class account_followup_print(osv.osv_memory):
                                                              ('payment_next_action_date', '!=', False)], context=context)
 
         partners_to_clear = []
-        for part in self.pool.get('res.partner').browse(cr, uid, ids, context=context): 
+        # browse unreconciled_aml_ids as superuser so that we can take into account unreconciled items for all
+        # companies
+        for part in self.pool.get('res.partner').browse(cr, SUPERUSER_ID, ids, context=context):
             if not part.unreconciled_aml_ids: 
                 partners_to_clear.append(part.id)
         self.pool.get('res.partner').action_done(cr, uid, partners_to_clear, context=context)
