@@ -49,7 +49,7 @@ import pytz
 import re
 import time
 from collections import defaultdict, MutableMapping
-from inspect import getmembers
+from inspect import getmembers, currentframe
 
 import babel.dates
 import dateutil.relativedelta
@@ -64,8 +64,9 @@ from .api import Environment
 from .exceptions import except_orm, AccessError, MissingError, ValidationError
 from .osv import fields
 from .osv.query import Query
-from .tools import lazy_property, ormcache
+from .tools import frozendict, lazy_property, ormcache
 from .tools.config import config
+from .tools.func import frame_codeinfo
 from .tools.misc import CountingStream, DEFAULT_SERVER_DATETIME_FORMAT, DEFAULT_SERVER_DATE_FORMAT
 from .tools.safe_eval import safe_eval as eval
 from .tools.translate import _
@@ -636,8 +637,9 @@ class BaseModel(object):
         attrs = {
             '_name': name,
             '_register': False,
-            '_columns': {},             # filled by _setup_fields()
-            '_defaults': {},            # filled by Field._determine_default()
+            '_columns': None,           # recomputed in _setup_fields()
+            '_defaults': None,          # recomputed in _setup_base()
+            '_fields': frozendict(),    # idem
             '_inherits': dict(cls._inherits),
             '_depends': dict(cls._depends),
             '_constraints': list(cls._constraints),
@@ -745,15 +747,40 @@ class BaseModel(object):
         for (key, _, msg) in cls._sql_constraints:
             cls.pool._sql_error[cls._table + '_' + key] = msg
 
-        # collect constraint and onchange methods
-        cls._constraint_methods = []
-        cls._onchange_methods = defaultdict(list)
-        for attr, func in getmembers(cls, callable):
-            if hasattr(func, '_constrains'):
-                cls._constraint_methods.append(func)
-            if hasattr(func, '_onchange'):
-                for name in func._onchange:
-                    cls._onchange_methods[name].append(func)
+    @property
+    def _constraint_methods(self):
+        """ Return a list of methods implementing Python constraints. """
+        def is_constraint(func):
+            return callable(func) and hasattr(func, '_constrains')
+
+        cls = type(self)
+        methods = []
+        for attr, func in getmembers(cls, is_constraint):
+            if not all(name in cls._fields for name in func._constrains):
+                _logger.warning("@constrains%r parameters must be field names", func._constrains)
+            methods.append(func)
+
+        # optimization: memoize result on cls, it will not be recomputed
+        cls._constraint_methods = methods
+        return methods
+
+    @property
+    def _onchange_methods(self):
+        """ Return a dictionary mapping field names to onchange methods. """
+        def is_onchange(func):
+            return callable(func) and hasattr(func, '_onchange')
+
+        cls = type(self)
+        methods = defaultdict(list)
+        for attr, func in getmembers(cls, is_onchange):
+            for name in func._onchange:
+                if name not in cls._fields:
+                    _logger.warning("@onchange%r parameters must be field names", func._onchange)
+                methods[name].append(func)
+
+        # optimization: memoize result on cls, it will not be recomputed
+        cls._onchange_methods = methods
+        return methods
 
     def __new__(cls):
         # In the past, this method was registering the model class in the server.
@@ -799,19 +826,6 @@ class BaseModel(object):
             assert cls._log_access, \
                 "TransientModels must have log_access turned on, " \
                 "in order to implement their access rights policy"
-
-        # retrieve new-style fields (from above registry class) and duplicate
-        # them (to avoid clashes with inheritance between different models)
-        cls._fields = {}
-        above = cls.__bases__[0]
-        for attr, field in getmembers(above, Field.__instancecheck__):
-            cls._add_field(attr, field.new())
-
-        # introduce magic fields
-        cls._add_magic_fields()
-
-        # register constraints and onchange methods
-        cls._init_constraints_onchanges()
 
         # prepare ormcache, which must be shared by all instances of the model
         cls._ormcache = {}
@@ -2884,6 +2898,7 @@ class BaseModel(object):
         cls._inherit_fields = struct = {}
         for parent_model, parent_field in cls._inherits.iteritems():
             parent = cls.pool[parent_model]
+            parent._inherits_reload()
             for name, column in parent._columns.iteritems():
                 struct[name] = (parent_model, parent_field, column, parent_model)
             for name, source in parent._inherit_fields.iteritems():
@@ -2941,25 +2956,27 @@ class BaseModel(object):
         if cls._setup_done:
             return
 
-        # first make sure that parent models determine all their fields
+        # 1. determine the proper fields of the model; duplicate them on cls to
+        # avoid clashes with inheritance between different models
+        for name in getattr(cls, '_fields', {}):
+            delattr(cls, name)
+
+        # retrieve fields from parent classes
+        cls._fields = {}
+        cls._defaults = {}
+        for attr, field in getmembers(cls, Field.__instancecheck__):
+            cls._add_field(attr, field.new())
+
+        # add magic and custom fields
+        cls._add_magic_fields()
+        cls._init_manual_fields(self._cr, partial)
+
+        # 2. make sure that parent models determine their own fields, then add
+        # inherited fields to cls
         cls._inherits_check()
         for parent in cls._inherits:
             self.env[parent]._setup_base(partial)
-
-        # remove inherited fields from cls._fields
-        for name, field in cls._fields.items():
-            if field.inherited:
-                del cls._fields[name]
-
-        # retrieve custom fields
-        cls._init_manual_fields(self._cr, partial)
-
-        # retrieve inherited fields
         cls._init_inherited_fields()
-
-        # prepare the setup of fields
-        for field in cls._fields.itervalues():
-            field.reset()
 
         cls._setup_done = True
 
@@ -2968,11 +2985,13 @@ class BaseModel(object):
         """ Setup the fields, except for recomputation triggers. """
         cls = type(self)
 
-        # set up fields, and update their corresponding columns
+        # set up fields, and determine their corresponding column
+        cls._columns = {}
         for name, field in cls._fields.iteritems():
             field.setup(self.env)
-            if field.store or field.column:
-                cls._columns[name] = field.to_column()
+            column = field.to_column()
+            if column:
+                cls._columns[name] = column
 
         # group fields by compute to determine field.computed_fields
         fields_by_compute = defaultdict(list)
@@ -3007,14 +3026,8 @@ class BaseModel(object):
         # register stuff about low-level function fields
         cls._init_function_fields(cls.pool, self._cr)
 
-        # check constraints
-        for func in cls._constraint_methods:
-            if not all(name in cls._fields for name in func._constrains):
-                _logger.warning("@constrains%r parameters must be field names", func._constrains)
-        for name in cls._onchange_methods:
-            if name not in cls._fields:
-                func = cls._onchange_methods[name]
-                _logger.warning("@onchange%r parameters must be field names", func._onchange)
+        # register constraints and onchange methods
+        cls._init_constraints_onchanges()
 
         # check defaults
         for name in cls._defaults:
@@ -3133,17 +3146,20 @@ class BaseModel(object):
         fields = self.check_field_access_rights('read', fields)
 
         # split fields into stored and computed fields
-        stored, computed = [], []
+        stored, inherited, computed = [], [], []
         for name in fields:
             if name in self._columns:
                 stored.append(name)
             elif name in self._fields:
                 computed.append(name)
+                field = self._fields[name]
+                if field.inherited and field.base_field.column:
+                    inherited.append(name)
             else:
                 _logger.warning("%s.read() with unknown field '%s'", self._name, name)
 
         # fetch stored fields from the database to the cache
-        self._read_from_database(stored)
+        self._read_from_database(stored, inherited)
 
         # retrieve results from records; this takes values from the cache and
         # computes remaining fields
@@ -3212,50 +3228,61 @@ class BaseModel(object):
                 self._cache[field] = FailedValue(e)
 
     @api.multi
-    def _read_from_database(self, field_names):
+    def _read_from_database(self, field_names, inherited_field_names=[]):
         """ Read the given fields of the records in `self` from the database,
             and store them in cache. Access errors are also stored in cache.
+
+            :param field_names: list of column names of model `self`; all those
+                fields are guaranteed to be read
+            :param inherited_field_names: list of column names from parent
+                models; some of those fields may not be read
         """
         env = self.env
         cr, user, context = env.args
 
-        # FIXME: The query construction needs to be rewritten using the internal Query
-        # object, as in search(), to avoid ambiguous column references when
-        # reading/sorting on a table that is auto_joined to another table with
-        # common columns (e.g. the magical columns)
+        # make a query object for selecting ids, and apply security rules to it
+        query = Query(['"%s"' % self._table], ['"%s".id IN %%s' % self._table], [])
+        self._apply_ir_rules(query, 'read')
+        order_str = self._generate_order_by(None, query)
 
-        # Construct a clause for the security rules.
-        # 'tables' holds the list of tables necessary for the SELECT, including
-        # the ir.rule clauses, and contains at least self._table.
-        rule_clause, rule_params, tables = env['ir.rule'].domain_get(self._name, 'read')
+        # determine the fields that are stored as columns in tables;
+        # for the sake of simplicity, discard inherited translated fields
+        fields = map(self._fields.get, field_names + inherited_field_names)
+        fields_pre = [
+            field
+            for field in fields
+            if field.base_field.column._classic_write
+            if not (field.inherited and field.base_field.column.translate)
+        ]
 
-        # determine the fields that are stored as columns in self._table
-        fields_pre = [f for f in field_names if self._columns[f]._classic_write]
-
-        # we need fully-qualified column names in case len(tables) > 1
-        def qualify(f):
-            if isinstance(self._columns.get(f), fields.binary) and \
-                    context.get('bin_size_%s' % f, context.get('bin_size')):
-                # PG 9.2 introduces conflicting pg_size_pretty(numeric) -> need ::cast 
-                return 'pg_size_pretty(length(%s."%s")::bigint) as "%s"' % (self._table, f, f)
+        # the query may involve several tables: we need fully-qualified names
+        def qualify(field):
+            col = field.name
+            if field.inherited:
+                res = self._inherits_join_calc(field.name, query)
             else:
-                return '%s."%s"' % (self._table, f)
-        qual_names = map(qualify, set(fields_pre + ['id']))
+                res = '"%s"."%s"' % (self._table, col)
+            if field.type == 'binary' and (context.get('bin_size') or context.get('bin_size_' + col)):
+                # PG 9.2 introduces conflicting pg_size_pretty(numeric) -> need ::cast
+                res = 'pg_size_pretty(length(%s)::bigint) as "%s"' % (res, col)
+            return res
 
-        query = """ SELECT %(qual_names)s FROM %(tables)s
-                    WHERE %(table)s.id IN %%s AND (%(extra)s)
-                    ORDER BY %(order)s
-                """ % {
-                    'qual_names': ",".join(qual_names),
-                    'tables': ",".join(tables),
-                    'table': self._table,
-                    'extra': " OR ".join(rule_clause) if rule_clause else "TRUE",
-                    'order': self._parent_order or self._order,
-                }
+        qual_names = map(qualify, set(fields_pre + [self._fields['id']]))
+
+        # determine the actual query to execute
+        from_clause, where_clause, where_params = query.get_sql()
+        query_str = """ SELECT %(qual_names)s FROM %(from_clause)s
+                        WHERE %(where_clause)s %(order_str)s
+                    """ % {
+                        'qual_names': ",".join(qual_names),
+                        'from_clause': from_clause,
+                        'where_clause': where_clause,
+                        'order_str': order_str,
+                    }
 
         result = []
         for sub_ids in cr.split_for_in_conditions(self.ids):
-            cr.execute(query, [tuple(sub_ids)] + rule_params)
+            cr.execute(query_str, [tuple(sub_ids)] + where_params)
             result.extend(cr.dictfetchall())
 
         ids = [vals['id'] for vals in result]
@@ -3264,8 +3291,9 @@ class BaseModel(object):
             # translate the fields if necessary
             if context.get('lang'):
                 ir_translation = env['ir.translation']
-                for f in fields_pre:
-                    if self._columns[f].translate:
+                for field in fields_pre:
+                    if not field.inherited and field.column.translate:
+                        f = field.name
                         #TODO: optimize out of this loop
                         res_trans = ir_translation._get_ids(
                             '%s,%s' % (self._name, f), 'model', context['lang'], ids)
@@ -3273,9 +3301,10 @@ class BaseModel(object):
                             vals[f] = res_trans.get(vals['id'], False) or vals[f]
 
             # apply the symbol_get functions of the fields we just read
-            for f in fields_pre:
-                symbol_get = self._columns[f]._symbol_get
+            for field in fields_pre:
+                symbol_get = field.base_field.column._symbol_get
                 if symbol_get:
+                    f = field.name
                     for vals in result:
                         vals[f] = symbol_get(vals[f])
 
@@ -3284,7 +3313,8 @@ class BaseModel(object):
                 record = self.browse(vals['id'])
                 record._cache.update(record._convert_to_cache(vals, validate=False))
 
-            # determine the fields that must be processed now
+            # determine the fields that must be processed now;
+            # for the sake of simplicity, we ignore inherited fields
             fields_post = [f for f in field_names if not self._columns[f]._classic_write]
 
             # Compute POST fields, grouped by multi
@@ -5462,7 +5492,9 @@ class BaseModel(object):
         """ Test whether two recordsets are equivalent (up to reordering). """
         if not isinstance(other, BaseModel):
             if other:
-                _logger.warning("Comparing apples and oranges: %s == %s", self, other)
+                filename, lineno = frame_codeinfo(currentframe(), 1)
+                _logger.warning("Comparing apples and oranges: %r == %r (%s:%s)",
+                                self, other, filename, lineno)
             return False
         return self._name == other._name and set(self._ids) == set(other._ids)
 
@@ -5776,6 +5808,11 @@ class BaseModel(object):
             values = dict(record._cache)
             # attach `self` with a different context (for cache consistency)
             record._origin = self.with_context(__onchange=True)
+
+        # load fields on secondary records, to avoid false changes
+        with env.do_in_onchange():
+            for field_seq in secondary:
+                record.mapped(field_seq)
 
         # determine which field(s) should be triggered an onchange
         todo = list(names) or list(values)
