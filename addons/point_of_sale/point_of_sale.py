@@ -1048,13 +1048,8 @@ class pos_order(osv.osv):
         have_to_group_by = session and session.config_id.group_by or False
 
         def compute_tax(amount, tax, line):
-            if amount > 0:
-                tax_code_id = tax['base_code_id']
-                tax_amount = line.price_subtotal * tax['base_sign']
-            else:
-                tax_code_id = tax['ref_base_code_id']
-                tax_amount = -line.price_subtotal * tax['ref_base_sign']
-
+            tax_code_id = tax['base_code_id']
+            tax_amount = line.price_subtotal * tax['base_sign']
             return (tax_code_id, tax_amount,)
 
         for order in self.browse(cr, uid, ids, context=context):
@@ -1147,10 +1142,7 @@ class pos_order(osv.osv):
 
                 for tax in computed_taxes:
                     tax_amount += cur_obj.round(cr, uid, cur, tax['amount'])
-                    if tax_amount < 0:
-                        group_key = (tax['ref_tax_code_id'], tax['base_code_id'], tax['account_collected_id'], tax['id'])
-                    else:
-                        group_key = (tax['tax_code_id'], tax['base_code_id'], tax['account_collected_id'], tax['id'])
+                    group_key = (tax['tax_code_id'], tax['base_code_id'], tax['account_collected_id'], tax['id'])
 
                     group_tax.setdefault(group_key, 0)
                     group_tax[group_key] += cur_obj.round(cr, uid, cur, tax['amount'])
@@ -1223,7 +1215,7 @@ class pos_order(osv.osv):
                     'credit': ((tax_amount>0) and tax_amount) or 0.0,
                     'debit': ((tax_amount<0) and -tax_amount) or 0.0,
                     'tax_code_id': key[tax_code_pos],
-                    'tax_amount': abs(tax_amount),
+                    'tax_amount': tax_amount,
                     'partner_id': order.partner_id and self.pool.get("res.partner")._find_accounting_partner(order.partner_id).id or False
                 })
 
