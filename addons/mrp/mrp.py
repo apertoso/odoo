@@ -73,6 +73,16 @@ class mrp_workcenter(osv.osv):
             value = {'costs_hour': cost.standard_price}
         return {'value': value}
 
+    def _check_capacity_per_cycle(self, cr, uid, ids, context=None):
+        for obj in self.browse(cr, uid, ids, context=context):
+            if obj.capacity_per_cycle <= 0.0:
+                return False
+        return True
+
+    _constraints = [
+        (_check_capacity_per_cycle, 'The capacity per cycle must be strictly positive.', ['capacity_per_cycle']),
+    ]
+
 mrp_workcenter()
 
 
@@ -247,19 +257,17 @@ class mrp_bom(osv.osv):
         return True
 
     def _check_product(self, cr, uid, ids, context=None):
-        all_prod = []
         boms = self.browse(cr, uid, ids, context=context)
-        def check_bom(boms):
+        def check_bom(boms, all_prod):
             res = True
             for bom in boms:
                 if bom.product_id.id in all_prod:
-                    res = res and False
-                all_prod.append(bom.product_id.id)
-                lines = bom.bom_lines
-                if lines:
-                    res = res and check_bom([bom_id for bom_id in lines if bom_id not in boms])
+                    return False
+                if bom.bom_lines:
+                    res = res and check_bom([b for b in bom.bom_lines if b not in boms], all_prod + [bom.product_id.id])
             return res
-        return check_bom(boms)
+        return check_bom(boms, [])
+
 
     _constraints = [
         (_check_recursion, 'Error ! You cannot create recursive BoM.', ['parent_id']),
@@ -795,6 +803,7 @@ class mrp_production(osv.osv):
                         continue
 
                     raw_product[0].action_consume(qty, raw_product[0].location_id.id, context=context)
+                    production.refresh()
 
         if production_mode == 'consume_produce':
             # To produce remaining qty of final product
@@ -820,6 +829,7 @@ class mrp_production(osv.osv):
                     raise osv.except_osv(_('Warning!'), _('You are going to produce total %s quantities of "%s".\nBut you can only produce up to total %s quantities.') % ((subproduct_factor * production_qty), prod_name, rest_qty))
                 if rest_qty > 0 :
                     stock_mov_obj.action_consume(cr, uid, [produce_product.id], (subproduct_factor * production_qty), context=context)
+                    production.refresh()
 
         for raw_product in production.move_lines2:
             new_parent_ids = []

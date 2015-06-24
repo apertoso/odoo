@@ -1482,10 +1482,11 @@ class account_invoice_line(osv.osv):
             raise osv.except_osv(_('No Partner Defined!'),_("You must first select a partner!") )
         if not product:
             if type in ('in_invoice', 'in_refund'):
-                return {'value': {}, 'domain':{'product_uom':[]}}
+                return {'value': {}, 'domain':{'uos_id':[]}}
             else:
-                return {'value': {'price_unit': 0.0}, 'domain':{'product_uom':[]}}
+                return {'value': {'price_unit': 0.0}, 'domain':{'uos_id':[]}}
         part = self.pool.get('res.partner').browse(cr, uid, partner_id, context=context)
+        product_uom_obj = self.pool.get('product.uom')
         fpos_obj = self.pool.get('account.fiscal.position')
         fpos = fposition_id and fpos_obj.browse(cr, uid, fposition_id, context=context) or False
 
@@ -1518,7 +1519,12 @@ class account_invoice_line(osv.osv):
             result.update({'price_unit': res.list_price, 'invoice_line_tax_id': tax_id})
         result['name'] = res.partner_ref
 
-        result['uos_id'] = uom_id or res.uom_id.id
+        result['uos_id'] = res.uom_id.id
+        if uom_id:
+            uom = product_uom_obj.browse(cr, uid, uom_id)
+            if res.uom_id.category_id.id == uom.category_id.id:
+                result['uos_id'] = uom_id
+
         if res.description:
             result['name'] += '\n'+res.description
 
@@ -1696,13 +1702,10 @@ class account_invoice_tax(osv.osv):
         cur_obj = self.pool.get('res.currency')
         company_obj = self.pool.get('res.company')
         company_currency = False
-        factor = 1
-        if ids:
-            factor = self.read(cr, uid, ids[0], ['factor_tax'])['factor_tax']
         if company_id:
             company_currency = company_obj.read(cr, uid, [company_id], ['currency_id'])[0]['currency_id'][0]
         if currency_id and company_currency:
-            amount = cur_obj.compute(cr, uid, currency_id, company_currency, amount*factor, context={'date': date_invoice or fields.date.context_today(self, cr, uid)}, round=False)
+            amount = cur_obj.compute(cr, uid, currency_id, company_currency, amount, context={'date': date_invoice or fields.date.context_today(self, cr, uid)}, round=False)
         return {'value': {'tax_amount': amount}}
 
     _order = 'sequence'
