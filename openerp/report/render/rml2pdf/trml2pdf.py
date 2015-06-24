@@ -767,8 +767,24 @@ class _rml_flowable(object):
             if extra_style:
                 style.__dict__.update(extra_style)
             result = []
-            for i in self._textual(node).split('\n'):
-                result.append(platypus.Paragraph(i, style, **(utils.attr_get(node, [], {'bulletText':'str'}))))
+# https://code.launchpad.net/~therp-nl/openobject-server/7.0-lp1260743_print_empty_lines/+merge/199103
+# start of removed stuff
+#            for i in self._textual(node).split('\n'):
+#                result.append(platypus.Paragraph(i, style, **(utils.attr_get(node, [], {'bulletText':'str'}))))
+# end of removed stuff
+# start new stuff
+            textuals = self._textual(node).split('\n')                         
+            keep_empty_lines = (len(textuals) > 1) and len(node.text.strip())  
+            for i in textuals:                                                 
+                if keep_empty_lines and len(i.strip()) == 0:                   
+                    i = '<font color="white">&nbsp;</font>'                    
+                result.append(
+                    platypus.Paragraph(
+                        i, style, **(
+                            utils.attr_get(node, [], {'bulletText':'str'}))
+                    )
+                )
+# end of new stuff
             return result
         elif node.tag=='barCode':
             try:
